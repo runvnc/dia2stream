@@ -47,6 +47,7 @@ class AudioChunk:
     frame_start: int
     frame_end: int
     is_final: bool = False
+    latency_ms: Optional[float] = None  # Time from request to this chunk
 
 
 @dataclass 
@@ -65,6 +66,10 @@ class StreamingSession:
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
     generation_start_step: int = 0
+    
+    # Timing
+    request_start_time: float = 0.0
+    first_chunk_sent: bool = False
     
     # Delay info
     max_delay: int = 0
@@ -119,9 +124,10 @@ class Dia2StreamingServer:
         )
         
         self.decode_every_n_frames = 1
+        self._is_warmed_up = False
         
     async def initialize(self):
-        """Load the model and build voice clone prefix. Call once at startup."""
+        """Load the model, build voice clone prefix, and warm up. Call once at startup."""
         logger.info(f"Loading Dia2 model from {self.model_repo}...")
         start = time.time()
         
@@ -157,7 +163,30 @@ class Dia2StreamingServer:
             else:
                 logger.warning("Failed to build prefix plan")
         
-    def _create_session(self, initial_text: str) -> StreamingSession:
+        # Warmup run to ensure everything is compiled/cached
+        await self._warmup()
+        
+    async def _warmup(self):
+        """Run a warmup generation to ensure all CUDA kernels are compiled."""
+        logger.info("Running warmup generation...")
+        warmup_start = time.time()
+        
+        # Generate a short phrase to warm up all code paths
+        warmup_text = "[S1] Hello."
+        chunks = []
+        
+        async for chunk in self.start_session(warmup_text):
+            chunks.append(chunk)
+        
+        # Reset session after warmup
+        self.session = None
+        self._is_warmed_up = True
+        
+        total_samples = sum(len(c.samples) for c in chunks)
+        logger.info(f"Warmup complete in {time.time() - warmup_start:.2f}s ({total_samples} samples generated)")
+        logger.info("Server ready for requests!")
+        
+    def _create_session(self, initial_text: str, request_time: float) -> StreamingSession:
         """Create a new streaming session with initial text."""
         runtime = self.dia._ensure_runtime()
         config = self.default_config
@@ -208,9 +237,7 @@ class Dia2StreamingServer:
         # Warmup with prefix if provided
         start_step = 0
         if prefix_plan is not None:
-            logger.info(f"Warming up with prefix ({prefix_plan.aligned_frames} frames)...")
             start_step = warmup_with_prefix(runtime, prefix_plan, sm_state, gen_state)
-            logger.info(f"Warmup complete, starting at step {start_step}")
         
         session = StreamingSession(
             runtime=runtime,
@@ -222,6 +249,7 @@ class Dia2StreamingServer:
             generation_start_step=start_step,
             last_decoded_step=start_step - 1,
             last_sent_sample=0,
+            request_start_time=request_time,
             max_delay=max_delay,
             flush_tail=flush_tail,
             positions=positions,
@@ -232,10 +260,11 @@ class Dia2StreamingServer:
             dep_logits_buf=dep_logits_buf,
         )
         
-        logger.info(f"Session created: max_delay={max_delay} frames, start_step={start_step}")
+        setup_time = (time.time() - request_time) * 1000
+        logger.info(f"Session created in {setup_time:.0f}ms, start_step={start_step}")
         return session
     
-    def inject_text(self, text: str):
+    def inject_text(self, text: str, request_time: float):
         """Inject new text into the current session."""
         if self.session is None:
             raise RuntimeError("No active session")
@@ -248,12 +277,15 @@ class Dia2StreamingServer:
         self.session.eos_cutoff = None
         self.session.sm_state.end_step = None
         self.session.generation_complete = False
+        self.session.request_start_time = request_time
+        self.session.first_chunk_sent = False
         
         logger.info(f"Injected {len(new_entries)} entries, queue: {len(self.session.sm_state.entries)}")
     
     async def start_session(self, initial_text: str) -> AsyncIterator[AudioChunk]:
         """Start a new session and begin streaming."""
-        self.session = self._create_session(initial_text)
+        request_time = time.time()
+        self.session = self._create_session(initial_text, request_time)
         self.session.is_generating = True
         
         async for chunk in self._generation_loop():
@@ -310,11 +342,18 @@ class Dia2StreamingServer:
         if len(new_samples) == 0:
             return None
         
+        # Calculate latency
+        now = time.time()
+        latency_ms = (now - session.request_start_time) * 1000
+        
+        # Log first chunk latency
+        if not session.first_chunk_sent:
+            session.first_chunk_sent = True
+            logger.info(f"*** FIRST CHUNK LATENCY: {latency_ms:.0f}ms ***")
+        
         start_sample = session.last_sent_sample
         session.last_sent_sample = total_samples
         session.last_decoded_step = up_to_step
-        
-        logger.debug(f"Decoded step {up_to_step}: {len(new_samples)} samples")
         
         return AudioChunk(
             samples=new_samples,
@@ -322,6 +361,7 @@ class Dia2StreamingServer:
             frame_start=start_sample,
             frame_end=total_samples,
             is_final=is_final,
+            latency_ms=latency_ms,
         )
     
     async def _generation_loop(self) -> AsyncIterator[AudioChunk]:
@@ -343,8 +383,6 @@ class Dia2StreamingServer:
         max_context = runtime.config.runtime.max_context_steps
         
         frames_since_last_decode = 0
-        
-        logger.info(f"Generation loop starting at step {session.current_step}")
         
         with torch.inference_mode():
             while session.is_generating:
@@ -470,7 +508,6 @@ class Dia2StreamingServer:
                     break
         
         session.is_generating = False
-        logger.info(f"Generation ended at step {session.current_step}")
         
         if not session.generation_complete:
             chunk = self._decode_and_get_new_samples(session.current_step, is_final=True)
@@ -493,28 +530,29 @@ async def handle_websocket(websocket, server: Dia2StreamingServer):
     try:
         async for message in websocket:
             try:
+                request_time = time.time()
                 data = json.loads(message)
                 cmd = data.get("cmd")
                 
                 if cmd == "start":
                     text = data.get("text", "")
-                    logger.info(f"Starting: {text[:50]}...")
+                    logger.info(f"START: {text[:50]}...")
                     
                     async for chunk in server.start_session(text):
                         pcm16 = (chunk.samples * 32767).astype(np.int16)
-                        header = struct.pack("<I", len(pcm16))
+                        header = struct.pack("<If", len(pcm16), chunk.latency_ms or 0)
                         await websocket.send(header + pcm16.tobytes())
                         if chunk.is_final:
                             await websocket.send(json.dumps({"event": "done"}))
                 
                 elif cmd == "inject":
                     text = data.get("text", "")
-                    logger.info(f"Injecting: {text[:50]}...")
-                    server.inject_text(text)
+                    logger.info(f"INJECT: {text[:50]}...")
+                    server.inject_text(text, request_time)
                     
                     async for chunk in server.continue_generation():
                         pcm16 = (chunk.samples * 32767).astype(np.int16)
-                        header = struct.pack("<I", len(pcm16))
+                        header = struct.pack("<If", len(pcm16), chunk.latency_ms or 0)
                         await websocket.send(header + pcm16.tobytes())
                         if chunk.is_final:
                             await websocket.send(json.dumps({"event": "done"}))

@@ -9,6 +9,7 @@ import asyncio
 import json
 import struct
 import wave
+import time
 import numpy as np
 
 try:
@@ -22,6 +23,7 @@ async def test_streaming():
     """Test the streaming TTS server."""
     
     uri = "wss://g8e5a4sdg8j9j8-3030.proxy.runpod.net/"
+    # uri = "ws://localhost:3030"
     
     print(f"Connecting to {uri}...")
     
@@ -29,6 +31,7 @@ async def test_streaming():
         # Test 1: Start a session
         print("\n=== Test 1: Starting session ===")
         
+        start_time = time.time()
         await ws.send(json.dumps({
             "cmd": "start",
             "text": "[S1] Hello! This is a test of the Dia2 streaming text to speech system."
@@ -36,17 +39,29 @@ async def test_streaming():
         
         all_samples = []
         sample_rate = 24000
+        first_chunk_time = None
+        first_chunk_latency_server = None
         
         while True:
             msg = await ws.recv()
             
             if isinstance(msg, bytes):
-                # Binary audio data
+                if first_chunk_time is None:
+                    first_chunk_time = time.time()
+                    client_latency = (first_chunk_time - start_time) * 1000
+                
+                # Parse header: 4 bytes sample count + 4 bytes latency
                 num_samples = struct.unpack("<I", msg[:4])[0]
-                pcm16 = np.frombuffer(msg[4:], dtype=np.int16)
+                server_latency = struct.unpack("<f", msg[4:8])[0]
+                pcm16 = np.frombuffer(msg[8:], dtype=np.int16)
                 samples = pcm16.astype(np.float32) / 32767.0
                 all_samples.append(samples)
-                print(f"  Received {len(samples)} samples ({len(samples)/sample_rate*1000:.0f}ms)")
+                
+                if first_chunk_latency_server is None:
+                    first_chunk_latency_server = server_latency
+                    print(f"  *** First chunk: client={client_latency:.0f}ms, server={server_latency:.0f}ms ***")
+                else:
+                    print(f"  Received {len(samples)} samples ({len(samples)/sample_rate*1000:.0f}ms)")
             else:
                 # JSON message
                 data = json.loads(msg)
@@ -63,7 +78,6 @@ async def test_streaming():
         # Test 2: Inject more text (should be faster!)
         print("\n=== Test 2: Injecting more text (should be low latency) ===")
         
-        import time
         start_time = time.time()
         
         await ws.send(json.dumps({
@@ -73,6 +87,7 @@ async def test_streaming():
         
         all_samples = []
         first_chunk_time = None
+        first_chunk_latency_server = None
         
         while True:
             msg = await ws.recv()
@@ -80,14 +95,19 @@ async def test_streaming():
             if isinstance(msg, bytes):
                 if first_chunk_time is None:
                     first_chunk_time = time.time()
-                    latency = (first_chunk_time - start_time) * 1000
-                    print(f"  *** First chunk latency: {latency:.0f}ms ***")
+                    client_latency = (first_chunk_time - start_time) * 1000
                 
                 num_samples = struct.unpack("<I", msg[:4])[0]
-                pcm16 = np.frombuffer(msg[4:], dtype=np.int16)
+                server_latency = struct.unpack("<f", msg[4:8])[0]
+                pcm16 = np.frombuffer(msg[8:], dtype=np.int16)
                 samples = pcm16.astype(np.float32) / 32767.0
                 all_samples.append(samples)
-                print(f"  Received {len(samples)} samples")
+                
+                if first_chunk_latency_server is None:
+                    first_chunk_latency_server = server_latency
+                    print(f"  *** First chunk: client={client_latency:.0f}ms, server={server_latency:.0f}ms ***")
+                else:
+                    print(f"  Received {len(samples)} samples")
             else:
                 data = json.loads(msg)
                 print(f"  Event: {data}")
@@ -111,6 +131,7 @@ async def test_streaming():
         
         all_samples = []
         first_chunk_time = None
+        first_chunk_latency_server = None
         
         while True:
             msg = await ws.recv()
@@ -118,12 +139,17 @@ async def test_streaming():
             if isinstance(msg, bytes):
                 if first_chunk_time is None:
                     first_chunk_time = time.time()
-                    latency = (first_chunk_time - start_time) * 1000
-                    print(f"  *** First chunk latency: {latency:.0f}ms ***")
+                    client_latency = (first_chunk_time - start_time) * 1000
                 
-                pcm16 = np.frombuffer(msg[4:], dtype=np.int16)
+                num_samples = struct.unpack("<I", msg[:4])[0]
+                server_latency = struct.unpack("<f", msg[4:8])[0]
+                pcm16 = np.frombuffer(msg[8:], dtype=np.int16)
                 samples = pcm16.astype(np.float32) / 32767.0
                 all_samples.append(samples)
+                
+                if first_chunk_latency_server is None:
+                    first_chunk_latency_server = server_latency
+                    print(f"  *** First chunk: client={client_latency:.0f}ms, server={server_latency:.0f}ms ***")
             else:
                 data = json.loads(msg)
                 print(f"  Event: {data}")
