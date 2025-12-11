@@ -1,5 +1,5 @@
 """
-Dia2 Streaming TTS Server with Persistent State
+Dia2 Streaming TTS Server with Persistent State and Voice Cloning
 
 Designed for single-conversation, low-latency voice call applications.
 Keeps model state warm between turns to minimize latency after initial warmup.
@@ -17,20 +17,22 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, AsyncIterator
 from collections import deque
+from pathlib import Path
 
 import torch
 import numpy as np
 
 # Local vendored dia2
 from dia2.engine import Dia2
-from dia2.generation import GenerationConfig, SamplingConfig, merge_generation_config, normalize_script
+from dia2.generation import GenerationConfig, SamplingConfig, PrefixConfig, merge_generation_config, normalize_script
 from dia2.runtime.context import RuntimeContext
 from dia2.runtime.script_parser import parse_script
-from dia2.runtime.generator import build_initial_state, GenerationState
+from dia2.runtime.generator import build_initial_state, GenerationState, warmup_with_prefix
 from dia2.runtime.state_machine import StateMachine, State, Entry
 from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
 from dia2.audio.grid import mask_audio_logits, undelay_frames
+from dia2.runtime.voice_clone import build_prefix_plan, PrefixPlan
 from dia2.runtime.logger import RuntimeLogger
 
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +60,7 @@ class StreamingSession:
     gen_state: GenerationState
     sm_state: State
     config: GenerationConfig
+    prefix_plan: Optional[PrefixPlan] = None
     
     # Generation tracking
     current_step: int = 0
@@ -65,6 +68,9 @@ class StreamingSession:
     last_sent_sample: int = 0    # Last PCM sample index we sent
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
+    
+    # Track where actual generated content starts (after prefix warmup)
+    generation_start_step: int = 0
     
     # Delay info (cached from runtime)
     max_delay: int = 0
@@ -97,10 +103,14 @@ class Dia2StreamingServer:
         model_repo: str = "nari-labs/Dia2-2B",
         device: str = "cuda",
         dtype: str = "bfloat16",
+        prefix_speaker_1: Optional[str] = None,
+        prefix_speaker_2: Optional[str] = None,
     ):
         self.model_repo = model_repo
         self.device = device
         self.dtype = dtype
+        self.prefix_speaker_1 = prefix_speaker_1
+        self.prefix_speaker_2 = prefix_speaker_2
         
         self.dia: Optional[Dia2] = None
         self.session: Optional[StreamingSession] = None
@@ -137,21 +147,54 @@ class Dia2StreamingServer:
         logger.info(f"Sample rate: {self.dia.sample_rate}")
         logger.info(f"Max context steps: {self.dia.max_context_steps}")
         
-    def _create_session(self, initial_text: str) -> StreamingSession:
-        """Create a new streaming session with initial text."""
+        if self.prefix_speaker_1:
+            logger.info(f"Voice clone speaker 1: {self.prefix_speaker_1}")
+        if self.prefix_speaker_2:
+            logger.info(f"Voice clone speaker 2: {self.prefix_speaker_2}")
+        
+    def _create_session(
+        self, 
+        initial_text: str,
+        prefix_speaker_1: Optional[str] = None,
+        prefix_speaker_2: Optional[str] = None,
+    ) -> StreamingSession:
+        """Create a new streaming session with initial text and optional voice cloning."""
         runtime = self.dia._ensure_runtime()
         config = self.default_config
+        
+        # Use instance defaults if not specified
+        prefix_s1 = prefix_speaker_1 or self.prefix_speaker_1
+        prefix_s2 = prefix_speaker_2 or self.prefix_speaker_2
+        
+        # Build prefix plan for voice cloning if audio files provided
+        prefix_plan = None
+        if prefix_s1:
+            logger.info(f"Building voice clone prefix from {prefix_s1}...")
+            prefix_config = PrefixConfig(
+                speaker_1=prefix_s1,
+                speaker_2=prefix_s2,
+                include_audio=False,  # Don't include prefix audio in output
+            )
+            prefix_plan = build_prefix_plan(runtime, prefix_config)
+            if prefix_plan:
+                logger.info(f"Prefix plan: {prefix_plan.aligned_frames} frames, {len(prefix_plan.entries)} entries")
         
         # Parse initial script
         text = normalize_script(initial_text)
         entries = list(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
         
+        # Combine prefix entries with script entries
+        all_entries = []
+        if prefix_plan is not None:
+            all_entries.extend(prefix_plan.entries)
+        all_entries.extend(entries)
+        
         # Initialize state machine
         runtime.machine.initial_padding = config.initial_padding
-        sm_state = runtime.machine.new_state(entries)
+        sm_state = runtime.machine.new_state(all_entries)
         
         # Build generation state
-        gen_state = build_initial_state(runtime, prefix=None)
+        gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
         # Calculate delays
         delay_tensor = runtime.audio_delay_tensor
@@ -176,13 +219,22 @@ class Dia2StreamingServer:
             for _ in range(runtime.model.depformer.num_depth)
         ]
         
+        # Warmup with prefix if provided
+        start_step = 0
+        if prefix_plan is not None:
+            logger.info(f"Warming up with prefix ({prefix_plan.aligned_frames} frames)...")
+            start_step = warmup_with_prefix(runtime, prefix_plan, sm_state, gen_state)
+            logger.info(f"Warmup complete, starting generation at step {start_step}")
+        
         session = StreamingSession(
             runtime=runtime,
             gen_state=gen_state,
             sm_state=sm_state,
             config=config,
-            current_step=0,
-            last_decoded_step=-1,
+            prefix_plan=prefix_plan,
+            current_step=start_step,
+            generation_start_step=start_step,
+            last_decoded_step=start_step - 1,
             last_sent_sample=0,
             max_delay=max_delay,
             flush_tail=flush_tail,
@@ -194,7 +246,7 @@ class Dia2StreamingServer:
             dep_logits_buf=dep_logits_buf,
         )
         
-        logger.info(f"Session created: max_delay={max_delay} frames ({max_delay * 80}ms)")
+        logger.info(f"Session created: max_delay={max_delay} frames ({max_delay * 80}ms), start_step={start_step}")
         return session
     
     def inject_text(self, text: str):
@@ -216,9 +268,14 @@ class Dia2StreamingServer:
         
         logger.info(f"Injected {len(new_entries)} entries, queue size: {len(self.session.sm_state.entries)}")
     
-    async def start_session(self, initial_text: str) -> AsyncIterator[AudioChunk]:
+    async def start_session(
+        self, 
+        initial_text: str,
+        prefix_speaker_1: Optional[str] = None,
+        prefix_speaker_2: Optional[str] = None,
+    ) -> AsyncIterator[AudioChunk]:
         """Start a new session with initial text and begin streaming."""
-        self.session = self._create_session(initial_text)
+        self.session = self._create_session(initial_text, prefix_speaker_1, prefix_speaker_2)
         self.session.is_generating = True
         
         async for chunk in self._generation_loop():
@@ -249,11 +306,15 @@ class Dia2StreamingServer:
         token_ids = runtime.constants
         
         # We need at least max_delay+1 steps to get any aligned frames
-        if up_to_step < session.max_delay:
+        # Also account for generation_start_step (after prefix warmup)
+        min_step = session.generation_start_step + session.max_delay
+        if up_to_step < min_step:
             return None
         
-        # Extract tokens from start to up_to_step
-        chunk_tokens = audio_buf[0, :, :up_to_step + 1].clone()
+        # Extract tokens from generation_start_step to up_to_step
+        # This excludes prefix audio and only decodes what we generated
+        start_idx = session.generation_start_step
+        chunk_tokens = audio_buf[0, :, start_idx:up_to_step + 1].clone()
         
         # Replace ungenerated with pad
         chunk_tokens = torch.where(
@@ -262,7 +323,7 @@ class Dia2StreamingServer:
             chunk_tokens
         )
         
-        # Undelay the full buffer
+        # Undelay the buffer
         aligned = undelay_frames(chunk_tokens, runtime.audio_delays, token_ids.audio_pad)
         
         if aligned.shape[-1] == 0:
@@ -433,7 +494,9 @@ class Dia2StreamingServer:
                 frames_since_last_decode += 1
                 
                 # Check if we should decode and yield
-                can_decode = (t + 1) > session.max_delay
+                # Account for generation_start_step when checking if we can decode
+                effective_frames = (t + 1) - session.generation_start_step
+                can_decode = effective_frames > session.max_delay
                 should_decode = can_decode and frames_since_last_decode >= self.decode_every_n_frames
                 
                 is_final = (session.eos_cutoff is not None and t + 1 >= session.eos_cutoff)
@@ -491,9 +554,11 @@ async def handle_websocket(websocket, server: Dia2StreamingServer):
                 
                 if cmd == "start":
                     text = data.get("text", "")
+                    prefix_s1 = data.get("prefix_speaker_1")
+                    prefix_s2 = data.get("prefix_speaker_2")
                     logger.info(f"Starting session with: {text[:50]}...")
                     
-                    async for chunk in server.start_session(text):
+                    async for chunk in server.start_session(text, prefix_s1, prefix_s2):
                         pcm16 = (chunk.samples * 32767).astype(np.int16)
                         header = struct.pack("<I", len(pcm16))
                         await websocket.send(header + pcm16.tobytes())
@@ -538,21 +603,30 @@ async def handle_websocket(websocket, server: Dia2StreamingServer):
 
 async def main():
     import websockets
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
+    parser.add_argument("--prefix-s1", type=str, help="Path to speaker 1 voice clone audio")
+    parser.add_argument("--prefix-s2", type=str, help="Path to speaker 2 voice clone audio")
+    parser.add_argument("--port", type=int, default=3030, help="WebSocket port")
+    args = parser.parse_args()
     
     server = Dia2StreamingServer(
         model_repo="nari-labs/Dia2-2B",
         device="cuda",
         dtype="bfloat16",
+        prefix_speaker_1=args.prefix_s1,
+        prefix_speaker_2=args.prefix_s2,
     )
     
     await server.initialize()
     
-    logger.info("Starting WebSocket server on ws://0.0.0.0:3030")
+    logger.info(f"Starting WebSocket server on ws://0.0.0.0:{args.port}")
     
     async with websockets.serve(
         lambda ws: handle_websocket(ws, server),
         "0.0.0.0",
-        3030,
+        args.port,
     ):
         await asyncio.Future()  # Run forever
 
