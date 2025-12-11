@@ -63,6 +63,10 @@ class StreamingSession:
     # For inject: decode from earlier in buffer to get instant audio
     decode_start_step: int = 0
     
+    # Mimi streaming decode state
+    mimi_kv: Optional[object] = None
+    mimi_decode_step: int = 0  # Last step we decoded with Mimi
+    
     # Incremental decode tracking
     last_decode_step: int = 0
     decoded_pcm_cache: Optional[np.ndarray] = None
@@ -205,6 +209,8 @@ class Dia2StreamingServer:
             decode_start_step=0,
             last_decode_step=0,
             decoded_pcm_cache=None,
+            mimi_kv=None,
+            mimi_decode_step=0,
             last_sent_sample=0,
             request_start_time=request_time,
             max_delay=max_delay,
@@ -228,17 +234,12 @@ class Dia2StreamingServer:
         session = self.session
         runtime = session.runtime
         
-        # For inject, we can decode from earlier in the buffer to get audio faster
-        # Instead of waiting for max_delay NEW frames, use existing buffer
-        # decode_start_step = max(0, current_step - max_delay) gives us instant decode capability
-        decode_start = max(0, session.current_step - session.max_delay)
-        
-        session.decode_start_step = decode_start
-        session.segment_start_step = decode_start  # Decode from earlier point
+        # For inject, start fresh segment from current position
+        session.segment_start_step = session.current_step
+        session.decode_start_step = session.current_step
         session.segment_samples_sent = 0
-        
-        # But track where new content starts for proper audio slicing
-        session.last_decode_step = session.current_step
+        # Keep mimi_kv and mimi_decode_step - we'll use streaming decode
+        # Don't reset mimi_kv - continue from where we left off
         session.decoded_pcm_cache = None
         
         text = normalize_script(text)
@@ -278,13 +279,14 @@ class Dia2StreamingServer:
         audio_buf = session.gen_state.audio_buf
         token_ids = runtime.constants
         
-        # Calculate frames available for decoding
-        # For inject: decode_start_step is set earlier in buffer, so we have frames immediately
-        # For start: decode_start_step = segment_start_step = 0
-        decode_start = session.decode_start_step
-        total_frames = up_to_step - decode_start
+        # Calculate frames available for decoding from segment start
+        total_frames = up_to_step - session.segment_start_step
         
-        if total_frames <= session.max_delay:
+        # For streaming decode with Mimi KV cache, we can decode sooner
+        # But we still need max_delay frames for the undelay alignment
+        frames_available = up_to_step - session.segment_start_step
+        
+        if frames_available <= session.max_delay:
             return None  # Not enough frames yet
         
         # Calculate how many NEW aligned frames we can decode
@@ -292,8 +294,8 @@ class Dia2StreamingServer:
         # The aligned output length is: total_frames - max_delay
         
         # For incremental decode, we decode the full range but only keep new samples
-        # This is because Mimi needs context for proper decoding
-        chunk_tokens = audio_buf[0, :, decode_start:up_to_step].clone()
+        decode_start = session.segment_start_step
+        chunk_tokens = audio_buf[0, :, decode_start:up_to_step + 1].clone()
         
         # Replace ungenerated tokens with pad
         chunk_tokens = torch.where(
@@ -462,8 +464,7 @@ class Dia2StreamingServer:
                 session.current_step = t + 1
                 frames_since_last_decode += 1
                 
-                frames_in_segment = (t + 1) - session.segment_start_step
-                frames_for_decode = (t + 1) - session.decode_start_step
+                frames_for_decode = (t + 1) - session.segment_start_step
                 can_decode = frames_for_decode > session.max_delay
                 should_decode = can_decode and frames_since_last_decode >= self.decode_every_n_frames
 

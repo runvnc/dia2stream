@@ -22,7 +22,7 @@ except ImportError:
 async def test_streaming():
     """Test the streaming TTS server."""
     
-    uri = "wss://g8e5a4sdg8j9j8-3030.proxy.runpod.net/"
+    uri = "wss://i9981txmurahrf-3030.proxy.runpod.net/"
     # uri = "ws://localhost:3030"
     
     print(f"Connecting to {uri}...")
