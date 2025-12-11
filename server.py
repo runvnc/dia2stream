@@ -2,7 +2,7 @@
 Dia2 Streaming TTS Server with Persistent State and Voice Cloning
 
 Usage:
-    python server.py --prefix-s1 voice.mp3
+    python server.py --prefix-s1 voice.mp3 --seed 42
     
 Then connect via WebSocket to ws://localhost:3030
 """
@@ -32,6 +32,10 @@ from dia2.runtime.voice_clone import build_prefix_plan, PrefixPlan
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Maximum prefix frames to use (longer prefixes slow down warmup significantly)
+# 75 frames = ~6 seconds at 12.5 fps
+MAX_PREFIX_FRAMES = 150
+
 
 @dataclass
 class AudioChunk:
@@ -56,11 +60,8 @@ class StreamingSession:
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
     
-    # Track where we started generating (after prefix)
     generation_start_step: int = 0
-    # Track where the CURRENT segment started (updated after each inject)
     segment_start_step: int = 0
-    # Track samples sent for current segment
     segment_samples_sent: int = 0
     
     request_start_time: float = 0.0
@@ -88,12 +89,14 @@ class Dia2StreamingServer:
         dtype: str = "bfloat16",
         prefix_speaker_1: Optional[str] = None,
         prefix_speaker_2: Optional[str] = None,
+        seed: Optional[int] = None,
     ):
         self.model_repo = model_repo
         self.device = device
         self.dtype = dtype
         self.prefix_speaker_1 = prefix_speaker_1
         self.prefix_speaker_2 = prefix_speaker_2
+        self.seed = seed
         
         self.dia: Optional[Dia2] = None
         self.session: Optional[StreamingSession] = None
@@ -109,6 +112,14 @@ class Dia2StreamingServer:
         )
         
         self.decode_every_n_frames = 1
+        
+    def _set_seed(self):
+        """Set random seed for reproducible generation."""
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed(self.seed)
+            np.random.seed(self.seed)
+            logger.info(f"Random seed set to {self.seed}")
         
     async def initialize(self):
         logger.info(f"Loading Dia2 model from {self.model_repo}...")
@@ -140,13 +151,21 @@ class Dia2StreamingServer:
             self._cached_prefix_plan = build_prefix_plan(runtime, prefix_config)
             
             if self._cached_prefix_plan:
+                frames = self._cached_prefix_plan.aligned_frames
                 logger.info(f"Voice clone built in {time.time() - prefix_start:.2f}s")
-                logger.info(f"  Frames: {self._cached_prefix_plan.aligned_frames}")
+                logger.info(f"  Frames: {frames} ({frames/12.5:.1f}s)")
                 logger.info(f"  Entries: {len(self._cached_prefix_plan.entries)}")
+                
+                # Warn if prefix is too long
+                if frames > MAX_PREFIX_FRAMES:
+                    logger.warning(f"  WARNING: Prefix is very long ({frames} frames).")
+                    logger.warning(f"  This will cause slow session creation (~{frames*0.03:.0f}s).")
+                    logger.warning(f"  Consider using shorter audio clips (3-10 seconds).")
             else:
                 logger.warning("Failed to build prefix plan!")
         
         # Warmup
+        self._set_seed()
         await self._warmup()
         
     async def _warmup(self):
@@ -162,6 +181,8 @@ class Dia2StreamingServer:
         logger.info("Server ready!")
         
     def _create_session(self, initial_text: str, request_time: float) -> StreamingSession:
+        self._set_seed()  # Reset seed for reproducible generation
+        
         runtime = self.dia._ensure_runtime()
         config = self.default_config
         prefix_plan = self._cached_prefix_plan
@@ -201,8 +222,10 @@ class Dia2StreamingServer:
         
         start_step = 0
         if prefix_plan is not None:
+            warmup_start = time.time()
             start_step = warmup_with_prefix(runtime, prefix_plan, sm_state, gen_state)
-            logger.info(f"Prefix warmup done, start_step={start_step}")
+            warmup_time = (time.time() - warmup_start) * 1000
+            logger.info(f"Prefix warmup: {warmup_time:.0f}ms, start_step={start_step}")
         
         session = StreamingSession(
             runtime=runtime,
@@ -237,7 +260,6 @@ class Dia2StreamingServer:
         session = self.session
         runtime = session.runtime
         
-        # Update segment tracking - new segment starts from current position
         session.segment_start_step = session.current_step
         session.segment_samples_sent = 0
         
@@ -272,18 +294,15 @@ class Dia2StreamingServer:
             yield chunk
     
     def _decode_segment(self, up_to_step: int, is_final: bool = False) -> Optional[AudioChunk]:
-        """Decode only the current segment (from segment_start_step)."""
         session = self.session
         runtime = session.runtime
         audio_buf = session.gen_state.audio_buf
         token_ids = runtime.constants
         
-        # Need enough frames after segment start to fill delay buffer
         frames_in_segment = up_to_step - session.segment_start_step
         if frames_in_segment <= session.max_delay:
             return None
         
-        # Decode only the current segment
         start_idx = session.segment_start_step
         chunk_tokens = audio_buf[0, :, start_idx:up_to_step + 1].clone()
         
@@ -305,7 +324,6 @@ class Dia2StreamingServer:
         
         total_samples = pcm.shape[-1]
         
-        # Only send samples we haven't sent for THIS segment
         if session.segment_samples_sent >= total_samples:
             return None
         
@@ -447,7 +465,6 @@ class Dia2StreamingServer:
                 session.current_step = t + 1
                 frames_since_last_decode += 1
                 
-                # Check decode based on segment, not global
                 frames_in_segment = (t + 1) - session.segment_start_step
                 can_decode = frames_in_segment > session.max_delay
                 should_decode = can_decode and frames_since_last_decode >= self.decode_every_n_frames
@@ -548,6 +565,7 @@ async def main():
     parser.add_argument("--prefix-s1", type=str, help="Speaker 1 voice")
     parser.add_argument("--prefix-s2", type=str, help="Speaker 2 voice")
     parser.add_argument("--port", type=int, default=3030)
+    parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args = parser.parse_args()
     
     server = Dia2StreamingServer(
@@ -556,6 +574,7 @@ async def main():
         dtype="bfloat16",
         prefix_speaker_1=args.prefix_s1,
         prefix_speaker_2=args.prefix_s2,
+        seed=args.seed,
     )
     
     await server.initialize()
