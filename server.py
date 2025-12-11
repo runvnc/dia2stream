@@ -2,7 +2,7 @@
 Dia2 Streaming TTS Server with Persistent State and Voice Cloning
 
 Usage:
-    python server.py --prefix-s1 voice.mp3 --seed 42
+    python server.py --seed 42
     
 Then connect via WebSocket to ws://localhost:3030
 """
@@ -32,10 +32,6 @@ from dia2.runtime.voice_clone import build_prefix_plan, PrefixPlan
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Maximum prefix frames to use (longer prefixes slow down warmup significantly)
-# 75 frames = ~6 seconds at 12.5 fps
-MAX_PREFIX_FRAMES = 150
-
 
 @dataclass
 class AudioChunk:
@@ -63,6 +59,13 @@ class StreamingSession:
     generation_start_step: int = 0
     segment_start_step: int = 0
     segment_samples_sent: int = 0
+    
+    # For inject: decode from earlier in buffer to get instant audio
+    decode_start_step: int = 0
+    
+    # Incremental decode tracking
+    last_decode_step: int = 0
+    decoded_pcm_cache: Optional[np.ndarray] = None
     
     request_start_time: float = 0.0
     first_chunk_sent: bool = False
@@ -111,7 +114,10 @@ class Dia2StreamingServer:
             use_torch_compile=False,
         )
         
-        self.decode_every_n_frames = 1
+        # Decode every N frames to reduce overhead
+        # Lower = more responsive but more decode calls
+        # Higher = fewer decode calls but chunkier audio
+        self.decode_every_n_frames = 3
         
     def _set_seed(self):
         """Set random seed for reproducible generation."""
@@ -136,34 +142,6 @@ class Dia2StreamingServer:
         logger.info(f"Model loaded in {time.time() - start:.2f}s")
         logger.info(f"Sample rate: {self.dia.sample_rate}")
         
-        # Build prefix plan at startup
-        if self.prefix_speaker_1:
-            logger.info(f"Building voice clone from {self.prefix_speaker_1}...")
-            if self.prefix_speaker_2:
-                logger.info(f"  Speaker 2: {self.prefix_speaker_2}")
-            prefix_start = time.time()
-            
-            prefix_config = PrefixConfig(
-                speaker_1=self.prefix_speaker_1,
-                speaker_2=self.prefix_speaker_2,
-                include_audio=False,
-            )
-            self._cached_prefix_plan = build_prefix_plan(runtime, prefix_config)
-            
-            if self._cached_prefix_plan:
-                frames = self._cached_prefix_plan.aligned_frames
-                logger.info(f"Voice clone built in {time.time() - prefix_start:.2f}s")
-                logger.info(f"  Frames: {frames} ({frames/12.5:.1f}s)")
-                logger.info(f"  Entries: {len(self._cached_prefix_plan.entries)}")
-                
-                # Warn if prefix is too long
-                if frames > MAX_PREFIX_FRAMES:
-                    logger.warning(f"  WARNING: Prefix is very long ({frames} frames).")
-                    logger.warning(f"  This will cause slow session creation (~{frames*0.03:.0f}s).")
-                    logger.warning(f"  Consider using shorter audio clips (3-10 seconds).")
-            else:
-                logger.warning("Failed to build prefix plan!")
-        
         # Warmup
         self._set_seed()
         await self._warmup()
@@ -185,19 +163,13 @@ class Dia2StreamingServer:
         
         runtime = self.dia._ensure_runtime()
         config = self.default_config
-        prefix_plan = self._cached_prefix_plan
         
         text = normalize_script(initial_text)
         entries = list(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
         
-        all_entries = []
-        if prefix_plan is not None:
-            all_entries.extend(prefix_plan.entries)
-        all_entries.extend(entries)
-        
         runtime.machine.initial_padding = config.initial_padding
-        sm_state = runtime.machine.new_state(all_entries)
-        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        sm_state = runtime.machine.new_state(entries)
+        gen_state = build_initial_state(runtime, prefix=None)
         
         delay_tensor = runtime.audio_delay_tensor
         max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
@@ -220,23 +192,19 @@ class Dia2StreamingServer:
             for _ in range(runtime.model.depformer.num_depth)
         ]
         
-        start_step = 0
-        if prefix_plan is not None:
-            warmup_start = time.time()
-            start_step = warmup_with_prefix(runtime, prefix_plan, sm_state, gen_state)
-            warmup_time = (time.time() - warmup_start) * 1000
-            logger.info(f"Prefix warmup: {warmup_time:.0f}ms, start_step={start_step}")
-        
         session = StreamingSession(
             runtime=runtime,
             gen_state=gen_state,
             sm_state=sm_state,
             config=config,
-            prefix_plan=prefix_plan,
-            current_step=start_step,
-            generation_start_step=start_step,
-            segment_start_step=start_step,
+            prefix_plan=None,
+            current_step=0,
+            generation_start_step=0,
+            segment_start_step=0,
             segment_samples_sent=0,
+            decode_start_step=0,
+            last_decode_step=0,
+            decoded_pcm_cache=None,
             last_sent_sample=0,
             request_start_time=request_time,
             max_delay=max_delay,
@@ -260,8 +228,18 @@ class Dia2StreamingServer:
         session = self.session
         runtime = session.runtime
         
-        session.segment_start_step = session.current_step
+        # For inject, we can decode from earlier in the buffer to get audio faster
+        # Instead of waiting for max_delay NEW frames, use existing buffer
+        # decode_start_step = max(0, current_step - max_delay) gives us instant decode capability
+        decode_start = max(0, session.current_step - session.max_delay)
+        
+        session.decode_start_step = decode_start
+        session.segment_start_step = decode_start  # Decode from earlier point
         session.segment_samples_sent = 0
+        
+        # But track where new content starts for proper audio slicing
+        session.last_decode_step = session.current_step
+        session.decoded_pcm_cache = None
         
         text = normalize_script(text)
         new_entries = list(parse_script([text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
@@ -293,45 +271,63 @@ class Dia2StreamingServer:
         async for chunk in self._generation_loop():
             yield chunk
     
-    def _decode_segment(self, up_to_step: int, is_final: bool = False) -> Optional[AudioChunk]:
+    def _decode_incremental(self, up_to_step: int, is_final: bool = False, is_inject: bool = False) -> Optional[AudioChunk]:
+        """Decode audio frames. For inject, can use existing buffer for instant audio."""
         session = self.session
         runtime = session.runtime
         audio_buf = session.gen_state.audio_buf
         token_ids = runtime.constants
         
-        frames_in_segment = up_to_step - session.segment_start_step
-        if frames_in_segment <= session.max_delay:
-            return None
+        # Calculate frames available for decoding
+        # For inject: decode_start_step is set earlier in buffer, so we have frames immediately
+        # For start: decode_start_step = segment_start_step = 0
+        decode_start = session.decode_start_step
+        total_frames = up_to_step - decode_start
         
-        start_idx = session.segment_start_step
-        chunk_tokens = audio_buf[0, :, start_idx:up_to_step + 1].clone()
+        if total_frames <= session.max_delay:
+            return None  # Not enough frames yet
         
+        # Calculate how many NEW aligned frames we can decode
+        # We need to decode from a point that gives us new aligned frames
+        # The aligned output length is: total_frames - max_delay
+        
+        # For incremental decode, we decode the full range but only keep new samples
+        # This is because Mimi needs context for proper decoding
+        chunk_tokens = audio_buf[0, :, decode_start:up_to_step].clone()
+        
+        # Replace ungenerated tokens with pad
         chunk_tokens = torch.where(
             chunk_tokens == token_ids.ungenerated,
             torch.full_like(chunk_tokens, token_ids.audio_pad),
             chunk_tokens
         )
         
+        # Undelay to align codebooks
         aligned = undelay_frames(chunk_tokens, runtime.audio_delays, token_ids.audio_pad)
         
         if aligned.shape[-1] == 0:
             return None
         
+        # Decode to PCM
         aligned = aligned.unsqueeze(0)
         with torch.inference_mode():
             pcm = runtime.mimi.decode(aligned)
             pcm = pcm[0, 0]
         
-        total_samples = pcm.shape[-1]
+        # Convert to numpy
+        pcm_np = pcm.cpu().numpy().astype(np.float32)
+        total_samples = len(pcm_np)
         
+        # Only send samples we haven't sent yet
         if session.segment_samples_sent >= total_samples:
             return None
         
-        new_samples = pcm[session.segment_samples_sent:].cpu().numpy().astype(np.float32)
+        new_samples = pcm_np[session.segment_samples_sent:]
         
         if len(new_samples) == 0:
             return None
         
+        # Calculate latency
         now = time.time()
         latency_ms = (now - session.request_start_time) * 1000
         
@@ -341,6 +337,7 @@ class Dia2StreamingServer:
         
         start_sample = session.segment_samples_sent
         session.segment_samples_sent = total_samples
+        session.last_decode_step = up_to_step
         
         return AudioChunk(
             samples=new_samples,
@@ -466,15 +463,16 @@ class Dia2StreamingServer:
                 frames_since_last_decode += 1
                 
                 frames_in_segment = (t + 1) - session.segment_start_step
-                can_decode = frames_in_segment > session.max_delay
+                frames_for_decode = (t + 1) - session.decode_start_step
+                can_decode = frames_for_decode > session.max_delay
                 should_decode = can_decode and frames_since_last_decode >= self.decode_every_n_frames
-                
+
                 is_final = (session.eos_cutoff is not None and t + 1 >= session.eos_cutoff)
                 if is_final:
                     should_decode = True
                 
                 if should_decode:
-                    chunk = self._decode_segment(t + 1, is_final)
+                    chunk = self._decode_incremental(t + 1, is_final)
                     if chunk is not None:
                         frames_since_last_decode = 0
                         yield chunk
@@ -488,7 +486,7 @@ class Dia2StreamingServer:
         session.is_generating = False
         
         if not session.generation_complete:
-            chunk = self._decode_segment(session.current_step, is_final=True)
+            chunk = self._decode_incremental(session.current_step, is_final=True)
             if chunk is not None:
                 yield chunk
     
