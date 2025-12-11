@@ -3,3 +3,4 @@ huggingface_hub
 websockets
 numpy
 soundfile
+whisper-timestamped
